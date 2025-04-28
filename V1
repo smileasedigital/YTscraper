@@ -1,0 +1,141 @@
+# Install required libraries
+!pip install --quiet google-api-python-client pandas tqdm isodate
+
+from googleapiclient.discovery import build
+import pandas as pd
+from tqdm.notebook import tqdm
+import time, random
+import isodate
+
+# --------- CONFIG ---------
+api_key       = 'YOUR_API_KEY_HERE'
+youtube       = build('youtube', 'v3', developerKey=api_key)
+
+keywords      = ['fitness', 'gym workout', 'home workout', 'muscle gain', 'fat loss',
+                 'calisthenics', 'HIIT', 'weight loss', 'fitness motivation', 'bodyweight training']
+max_channels  = 100             # Pool size for discovery
+min_subs      = 25000
+max_subs      = 300000
+min_avg_views = 300             # Lower bound for average views
+max_avg_views = 6000            # Upper bound for average views
+
+# --------- HELPER: Safe Execute ---------
+def safe_execute(request):
+    try:
+        return request.execute()
+    except Exception as e:
+        if 'quotaExceeded' in str(e):
+            print("\n⚠️ Quota exceeded, stopping further API calls.")
+            raise SystemExit
+        else:
+            raise
+
+# --------- STEP 1: DISCOVER CHANNEL IDs ---------
+def search_channel_ids(keywords, max_results=50, pages=5):
+    ids = set()
+    for kw in keywords:
+        token = None
+        for _ in range(pages):
+            req = youtube.search().list(
+                q=kw,
+                type='channel',
+                part='snippet',
+                maxResults=max_results,
+                pageToken=token
+            )
+            res = safe_execute(req)
+            for item in res.get('items', []):
+                ids.add(item['snippet']['channelId'])
+            token = res.get('nextPageToken')
+            if not token or len(ids) >= max_channels:
+                break
+            time.sleep(random.uniform(0.5, 1.2))
+    return list(ids)[:max_channels]
+
+# --------- STEP 2: FETCH & FILTER CHANNEL METADATA ---------
+def filter_channels(channel_ids):
+    filtered = []
+    for i in tqdm(range(0, len(channel_ids), 50), desc='Filtering channels'):
+        batch = channel_ids[i:i+50]
+        req = youtube.channels().list(
+            part='snippet,statistics',
+            id=','.join(batch)
+        )
+        res = safe_execute(req)
+
+        for ch in res.get('items', []):
+            subs = int(ch['statistics'].get('subscriberCount', 0))
+            country = ch['snippet'].get('country')
+            # Apply subscriber + country filters
+            if not (min_subs <= subs <= max_subs):
+                continue
+            if country != 'US':
+                continue
+
+            filtered.append({
+                'id': ch['id'],
+                'title': ch['snippet']['title'],
+                'subs': subs,
+                'country': country
+            })
+        time.sleep(1)
+    return filtered
+
+# --------- STEP 3: CALC AVG VIEWS FOR LONGFORM ---------
+def get_avg_longform_views(channel_id, last_n=10):
+    # Fetch last videos (max 20 to account for shorts filtering)
+    req = youtube.search().list(
+        channelId=channel_id,
+        part='id',
+        order='date',
+        maxResults=last_n * 2,
+        type='video'
+    )
+    res = safe_execute(req)
+    vids = [item['id']['videoId'] for item in res.get('items', [])]
+
+    if not vids:
+        return 0
+
+    # Get stats + duration
+    stats_req = youtube.videos().list(
+        part='statistics,contentDetails',
+        id=','.join(vids)
+    )
+    stats_res = safe_execute(stats_req)
+
+    # Filter for longform (>60s) and collect views
+    views = []
+    for vid in stats_res.get('items', []):
+        duration = isodate.parse_duration(vid['contentDetails']['duration']).total_seconds()
+        if duration > 60:
+            views.append(int(vid['statistics'].get('viewCount', 0)))
+    if not views:
+        return 0
+    # Compute average of last_n longform videos (take first last_n)
+    return sum(views[:last_n]) / min(len(views), last_n)
+
+# --------- MAIN ---------
+channel_ids = search_channel_ids(keywords)
+meta = filter_channels(channel_ids)
+
+results = []
+for ch in tqdm(meta, desc='Computing avg views'):
+    avg_views = get_avg_longform_views(ch['id'])
+    if not (min_avg_views <= avg_views <= max_avg_views):
+        continue
+    results.append({
+        'Channel Name': ch['title'],
+        'Subscribers': ch['subs'],
+        'Avg Longform Views (last 10)': round(avg_views),
+        'Country': ch['country'],
+        'Channel URL': f"https://www.youtube.com/channel/{ch['id']}"
+    })
+    time.sleep(1)
+
+# Create DataFrame & save
+import pandas as pd
+df = pd.DataFrame(results)
+df.to_csv(f'{category}_US_filtered_longform.csv', index=False)
+
+df.head()
